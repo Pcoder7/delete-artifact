@@ -56,63 +56,80 @@ jobs:
           fi
           echo "Inputs validated: REPO=$REPO, DATE=$DATE"
 
-      - name: List & Delete artifacts for the given date
+      - name: List & Delete artifacts for the given date (with pagination)
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           TARGET_REPO: ${{ github.event.inputs.target_repo }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: |
-          echo "Fetching artifacts from $TARGET_REPO created on $TARGET_DATE …"
+          echo "Deleting artifacts from $TARGET_REPO created on $TARGET_DATE …"
 
-          # 1) Call the API to fetch all artifacts
-          RESPONSE=$(curl -s \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$TARGET_REPO/actions/artifacts")
+          PAGE=1
+          ALL_DELETED=0
 
-          # 2) Check for API-level errors (e.g. 404 = repo not found or insufficient permissions)
-          MESSAGE=$(echo "$RESPONSE" | jq -r '.message // empty')
-          if [[ "$MESSAGE" == "Not Found" ]]; then
-            echo "Error: Repository '$TARGET_REPO' not found or insufficient permissions."
-            echo "Make sure TARGET_REPO_PAT has access to list artifacts on $TARGET_REPO."
-            exit 1
-          fi
-          if [[ -n "$MESSAGE" && "$MESSAGE" != "null" ]]; then
-            echo "Error: Unexpected API message: $MESSAGE"
-            exit 1
-          fi
-
-          # 3) If .artifacts is null/empty, inform the user
-          EXISTS=$(echo "$RESPONSE" | jq '.artifacts // empty')
-          if [[ -z "$EXISTS" ]]; then
-            echo "→ No artifacts key in response. Either there truly are no artifacts, or the PAT lacks permission."
-            echo "→ Raw response snippet: ${RESPONSE:0:200}"
-            exit 0
-          fi
-
-          # 4) Extract IDs for artifacts whose created_at starts with TARGET_DATE
-          ARTIFACT_IDS=$(echo "$RESPONSE" | jq -r --arg TD "$TARGET_DATE" '
-            .artifacts[]
-            | select(.created_at | startswith($TD))
-            | .id
-          ')
-
-          if [ -z "$ARTIFACT_IDS" ]; then
-            echo "No artifacts found in $TARGET_REPO with created_at = $TARGET_DATE"
-            exit 0
-          fi
-
-          echo "Found artifact IDs to delete:"
-          echo "$ARTIFACT_IDS"
-
-          # 5) Delete each artifact by ID
-          echo "$ARTIFACT_IDS" | while read -r ID; do
-            echo "→ Deleting artifact ID $ID"
-            curl -s -X DELETE \
+          while true; do
+            echo "Fetching page $PAGE of artifacts…"
+            RESPONSE=$(curl -s \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$TARGET_REPO/actions/artifacts/$ID"
+              "https://api.github.com/repos/$TARGET_REPO/actions/artifacts?per_page=100&page=$PAGE")
+
+            # Check for “Not Found” or other API errors
+            MESSAGE=$(echo "$RESPONSE" | jq -r '.message // empty')
+            if [[ "$MESSAGE" == "Not Found" ]]; then
+              echo "Error: Repository '$TARGET_REPO' not found or insufficient permissions."
+              exit 1
+            fi
+            if [[ -n "$MESSAGE" && "$MESSAGE" != "null" ]]; then
+              echo "Error: Unexpected API message: $MESSAGE"
+              exit 1
+            fi
+
+            # Extract artifacts array (could be empty)
+            ARTIFACTS=$(echo "$RESPONSE" | jq -r '.artifacts // []')
+
+            # If no artifacts on this page, stop
+            if [[ $(echo "$ARTIFACTS" | jq 'length') -eq 0 ]]; then
+              echo "No more artifacts on page $PAGE; exiting loop."
+              break
+            fi
+
+            # From this page, pick only those created_at starting with TARGET_DATE
+            IDS_TO_DELETE=$(echo "$ARTIFACTS" | jq -r --arg TD "$TARGET_DATE" '
+              .[]
+              | select(.created_at | startswith($TD))
+              | .id
+            ')
+
+            if [[ -z "$IDS_TO_DELETE" ]]; then
+              echo "No artifacts on page $PAGE match date $TARGET_DATE."
+            else
+              echo "Found these artifact IDs on page $PAGE for $TARGET_DATE:"
+              echo "$IDS_TO_DELETE"
+              echo "$IDS_TO_DELETE" | while read -r ID; do
+                echo "→ Deleting artifact ID $ID"
+                curl -s -X DELETE \
+                  -H "Authorization: Bearer $GITHUB_TOKEN" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "https://api.github.com/repos/$TARGET_REPO/actions/artifacts/$ID"
+                ALL_DELETED=1
+              done
+            fi
+
+            # If fewer than 100 artifacts returned, we know there is no next page
+            COUNT_ON_PAGE=$(echo "$ARTIFACTS" | jq 'length')
+            if [[ $COUNT_ON_PAGE -lt 100 ]]; then
+              echo "Fewer than 100 artifacts on page $PAGE ($COUNT_ON_PAGE), so this was the last page."
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
           done
 
-          echo "Completed deletion of artifacts created on $TARGET_DATE from $TARGET_REPO."
+          if [[ $ALL_DELETED -eq 0 ]]; then
+            echo "No artifacts matching $TARGET_DATE were found across all pages."
+          else
+            echo "Finished deleting all artifacts from date $TARGET_DATE."
+          fi
+
