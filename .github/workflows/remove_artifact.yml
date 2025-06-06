@@ -1,0 +1,72 @@
+name: Delete Artifacts By Date
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Delete artifacts created on this date (YYYY-MM-DD)'
+        required: true
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  delete_artifacts_by_date:
+    name: Delete Artifacts Created On ${{ github.event.inputs.target_date }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install jq if missing
+        shell: bash
+        run: |
+          if ! command -v jq &> /dev/null; then
+            echo "Installing jq..."
+            apt-get update -qy
+            apt-get install -qy jq
+          fi
+
+      - name: Delete artifacts for the given date
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+        run: |
+          # Validate that TARGET_DATE is non-empty and in YYYY-MM-DD format
+          if [[ -z "$TARGET_DATE" ]]; then
+            echo "Error: No date provided. Please enter a date in YYYY-MM-DD format when you click 'Run workflow'."
+            exit 1
+          fi
+          if [[ ! "$TARGET_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "Error: Provided date '$TARGET_DATE' is not in YYYY-MM-DD format."
+            exit 1
+          fi
+
+          echo "Deleting artifacts created on date: $TARGET_DATE"
+
+          # Fetch all artifacts and filter those whose created_at starts with TARGET_DATE
+          ARTIFACT_IDS=$(curl -s \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts" \
+            | jq -r --arg td "$TARGET_DATE" '
+                .artifacts[]
+                | select(.created_at | startswith($td))
+                | .id
+              ')
+
+          if [ -z "$ARTIFACT_IDS" ]; then
+            echo "No artifacts found with created_at = $TARGET_DATE"
+            exit 0
+          fi
+
+          echo "Found the following artifact IDs to delete:"
+          echo "$ARTIFACT_IDS"
+
+          echo "$ARTIFACT_IDS" | while read -r ID; do
+            echo "→ Deleting artifact ID $ID"
+            curl -s -X DELETE \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID"
+          done
