@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 env:
-  # Personal access token with repo scope or appropriate permissions for the target repo
+  # Must be a PAT (or token) that has repo:actions permission on the target repository
   TARGET_REPO_PAT: ${{ secrets.PAT_TOKEN }}
 
 jobs:
@@ -56,7 +56,7 @@ jobs:
           fi
           echo "Inputs validated: REPO=$REPO, DATE=$DATE"
 
-      - name: List and delete artifacts
+      - name: List & Delete artifacts for the given date
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
@@ -65,18 +65,33 @@ jobs:
         run: |
           echo "Fetching artifacts from $TARGET_REPO created on $TARGET_DATE …"
 
-          # Fetch all artifacts JSON
+          # 1) Call the API to fetch all artifacts
           RESPONSE=$(curl -s \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$TARGET_REPO/actions/artifacts")
 
-          # Show raw response snippet
-          echo "Raw API response (first 200 chars):"
-          echo "${RESPONSE:0:200}"
-          echo "…"
+          # 2) Check for API-level errors (e.g. 404 = repo not found or insufficient permissions)
+          MESSAGE=$(echo "$RESPONSE" | jq -r '.message // empty')
+          if [[ "$MESSAGE" == "Not Found" ]]; then
+            echo "Error: Repository '$TARGET_REPO' not found or insufficient permissions."
+            echo "Make sure TARGET_REPO_PAT has access to list artifacts on $TARGET_REPO."
+            exit 1
+          fi
+          if [[ -n "$MESSAGE" && "$MESSAGE" != "null" ]]; then
+            echo "Error: Unexpected API message: $MESSAGE"
+            exit 1
+          fi
 
-          # Extract artifacts created exactly on TARGET_DATE (UTC)
+          # 3) If .artifacts is null/empty, inform the user
+          EXISTS=$(echo "$RESPONSE" | jq '.artifacts // empty')
+          if [[ -z "$EXISTS" ]]; then
+            echo "→ No artifacts key in response. Either there truly are no artifacts, or the PAT lacks permission."
+            echo "→ Raw response snippet: ${RESPONSE:0:200}"
+            exit 0
+          fi
+
+          # 4) Extract IDs for artifacts whose created_at starts with TARGET_DATE
           ARTIFACT_IDS=$(echo "$RESPONSE" | jq -r --arg TD "$TARGET_DATE" '
             .artifacts[]
             | select(.created_at | startswith($TD))
@@ -91,7 +106,7 @@ jobs:
           echo "Found artifact IDs to delete:"
           echo "$ARTIFACT_IDS"
 
-          # Delete each artifact by ID
+          # 5) Delete each artifact by ID
           echo "$ARTIFACT_IDS" | while read -r ID; do
             echo "→ Deleting artifact ID $ID"
             curl -s -X DELETE \
