@@ -1,83 +1,103 @@
-name: Delete Artifacts By Date
+name: Delete Artifacts by Date and Repo
 
 on:
   workflow_dispatch:
     inputs:
+      target_repo:
+        description: 'The repository (owner/repo) whose artifacts you want to delete'
+        required: true
+        type: string
       target_date:
         description: 'Delete artifacts created on this date (YYYY-MM-DD)'
         required: true
-        default: ''
         type: string
 
 permissions:
   contents: write
 
+env:
+  # Personal access token with repo scope or appropriate permissions for the target repo
+  TARGET_REPO_PAT: ${{ secrets.PAT_TOKEN }}
+
 jobs:
-  delete_artifacts_by_date:
-    name: Delete Artifacts Created On ${{ github.event.inputs.target_date }}
+  delete_artifacts:
+    name: Delete Artifacts on ${{ github.event.inputs.target_date }} from ${{ github.event.inputs.target_repo }}
     runs-on: ubuntu-latest
     steps:
       - name: Install jq if missing
         shell: bash
         run: |
           if ! command -v jq &> /dev/null; then
-            echo "Installing jq..."
+            echo "Installing jq…"
             apt-get update -qy
             apt-get install -qy jq
           fi
-      
-      - name: List all artifact IDs & created_at
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          curl -s \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts" \
-            | jq -r '.artifacts[] | "\(.id) \(.name) \(.created_at)"'
 
-      - name: Delete artifacts for the given date
+      - name: Validate inputs
+        shell: bash
+        run: |
+          REPO="${{ github.event.inputs.target_repo }}"
+          DATE="${{ github.event.inputs.target_date }}"
+          if [[ -z "$REPO" ]]; then
+            echo "Error: target_repo is required."
+            exit 1
+          fi
+          if [[ ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "Error: target_repo must be in 'owner/repo' format."
+            exit 1
+          fi
+          if [[ -z "$DATE" ]]; then
+            echo "Error: target_date is required."
+            exit 1
+          fi
+          if [[ ! "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "Error: target_date must be YYYY-MM-DD."
+            exit 1
+          fi
+          echo "Inputs validated: REPO=$REPO, DATE=$DATE"
+
+      - name: List and delete artifacts
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TARGET_REPO: ${{ github.event.inputs.target_repo }}
           TARGET_DATE: ${{ github.event.inputs.target_date }}
         run: |
-          # Validate that TARGET_DATE is non-empty and in YYYY-MM-DD format
-          if [[ -z "$TARGET_DATE" ]]; then
-            echo "Error: No date provided. Please enter a date in YYYY-MM-DD format when you click 'Run workflow'."
-            exit 1
-          fi
-          if [[ ! "$TARGET_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            echo "Error: Provided date '$TARGET_DATE' is not in YYYY-MM-DD format."
-            exit 1
-          fi
+          echo "Fetching artifacts from $TARGET_REPO created on $TARGET_DATE …"
 
-          echo "Deleting artifacts created on date: $TARGET_DATE"
-
-          # Fetch all artifacts and filter those whose created_at starts with TARGET_DATE
-          ARTIFACT_IDS=$(curl -s \
+          # Fetch all artifacts JSON
+          RESPONSE=$(curl -s \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts" \
-            | jq -r --arg td "$TARGET_DATE" '
-                .artifacts[]
-                | select(.created_at | startswith($td))
-                | .id
-              ')
+            "https://api.github.com/repos/$TARGET_REPO/actions/artifacts")
+
+          # Show raw response snippet
+          echo "Raw API response (first 200 chars):"
+          echo "${RESPONSE:0:200}"
+          echo "…"
+
+          # Extract artifacts created exactly on TARGET_DATE (UTC)
+          ARTIFACT_IDS=$(echo "$RESPONSE" | jq -r --arg TD "$TARGET_DATE" '
+            .artifacts[]
+            | select(.created_at | startswith($TD))
+            | .id
+          ')
 
           if [ -z "$ARTIFACT_IDS" ]; then
-            echo "No artifacts found with created_at = $TARGET_DATE"
+            echo "No artifacts found in $TARGET_REPO with created_at = $TARGET_DATE"
             exit 0
           fi
 
-          echo "Found the following artifact IDs to delete:"
+          echo "Found artifact IDs to delete:"
           echo "$ARTIFACT_IDS"
 
+          # Delete each artifact by ID
           echo "$ARTIFACT_IDS" | while read -r ID; do
             echo "→ Deleting artifact ID $ID"
             curl -s -X DELETE \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID"
+              "https://api.github.com/repos/$TARGET_REPO/actions/artifacts/$ID"
           done
+
+          echo "Completed deletion of artifacts created on $TARGET_DATE from $TARGET_REPO."
